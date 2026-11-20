@@ -17,7 +17,9 @@
    `crosvm-mmio`。这一条不过，编译产物没有地方运行。
 2. **最省事的编译**：有 Ubuntu 机器就走路线 B（全本地）；没有就走路线 A（Actions 出产物）。
    两条路线都需要在最后连手机，用 K90 自己的 `generated.dtb` 重建一次 `boot.img`。
-3. **三样仓库外的东西**：`edk2-macos.fd`、`ios/tools/droidvm-app.py`、`data-pcie.img` 转换器。
+3. **两样仓库外的东西 + 一样仓库内但不在自动流程里的东西**：`edk2-macos.fd` 来自公开的
+   `Droid-VM/edk2-gunyah`（`macOS` 分支）；`ios/tools/droidvm-app.py` 来自作者私有的 `ios` 工作区；
+   `data-store.img → data-pcie.img` 转换器就在本仓库 `research/pcie-data-2026-11-11/`。
    没有它们可以完成“编译 + 内核/系统启动验证”，但无法完成“产品化首次安装 + GPU”。
 4. **只想先验证内核能起**：直接走第 8 节的 `run-macos-vm.py`，不需要 App 的 VM 注册，也不需要 `edk2-macos.fd`。
 
@@ -130,10 +132,12 @@ cp out/ci-image/{boot.img,manifest.json,kernel.macho.trustcache} out/product/k27
    `boot.img`（见 5.2），而不是直接部署 CI 的 `boot.img`。
 2. **Data 盘格式**：`configs/product-k27.json` 当前是 `MACOS_DATA_PCI=1`，App 的 VM 会打开
    `MacOS/data-pcie.img`（原生 GPT/APFS + virtio-blk PCI）。CI 只产出 `data-store.img`
-   （`DroidVMDataStore` 覆盖层格式），**仓库里没有把 `data-store.img` 转成 `data-pcie.img` 的脚本**
-   （转换器只在未入库的 `research/` 工作目录里）。新装一台 K90 时，要么自备/自行转换
-   `data-pcie.img`，要么改走旧的 MMIO 数据盘路径（需要额外 `NativeVirtioBlock`/`NativeRamBlock` kext，
-   见 [try.sh](file:///workspace/k27/try.sh#L22-L26)，不建议作为第一步）。
+   （`DroidVMDataStore` 覆盖层格式）。转换器在本仓库
+   [research/pcie-data-2026-11-11/](file:///workspace/research/pcie-data-2026-11-11/) 里，
+   包含 `prepare-gpt.py`、`store-to-raw.c`、`persist-file.c`；它们是 P4 迁移时提交的，
+   `.gitignore` 的 `research/` 不影响已跟踪文件。用法见 5.4。若不想转换，可改走旧的 MMIO 数据盘路径
+   （需要额外 `NativeVirtioBlock`/`NativeRamBlock` kext，见
+   [try.sh](file:///workspace/k27/try.sh#L22-L26)，不建议作为第一步）。
 
 ---
 
@@ -356,8 +360,20 @@ adb shell su -c 'ls -l /data/media/0/DroidVM/MacOS/edk2-macos.fd'
      这样 VM 用 App 自带的 `edk2-gunyah.fd` 和 simplefb，先验证内核/系统能起来，再补固件开 GPU。
      （`product.py` 会用 `configs/product-k27.json` 的 env 覆盖你的环境变量；要临时改走路
      `droidvm-app.py`，或改配置。）
-- 本仓库只有 `overlay/edk2/GunyahBootPkg/` 和 `sources/edk2/`，**没有** `edk2-macos.fd` 的构建脚本；
-  它来自仓库外的 `~/edk2-gunyah-topo`（`-D VIRTIO_GPU_ENABLE=FALSE`）。
+- 来源：公开仓库 [`Droid-VM/edk2-gunyah`](https://github.com/Droid-VM/edk2-gunyah) 的 `macOS` 分支。
+  该分支把 CPU topology（`pr/cpu-topology` 的 `59aca6f`）和 `VIRTIO_GPU_ENABLE` 开关合并在一起，
+  版本字符串形如 `0.1.r56.59aca6f-macos-novgpu`。构建：
+
+  ```sh
+  git clone https://github.com/Droid-VM/edk2-gunyah.git
+  cd edk2-gunyah && git checkout macOS
+  ./build.sh -D VIRTIO_GPU_ENABLE=FALSE
+  adb push edk2-gunyah.fd /data/media/0/DroidVM/MacOS/edk2-macos.fd
+  ```
+
+  依赖 `gcc-aarch64-linux-gnu`、`acpica-tools`（`iasl`）。`build.sh` 会初始化 `edk2` 子模块并应用
+  `patches/edk2/*`。**App 自带的那份 `edk2-gunyah.fd` 带 `GunyahVirtioGpuDxe`，不要直接改名使用。**
+  edk2-gunyah 的 README 已把 Redmi K90 Pro Max（SM8850，codename `myron`）列为测试机型。
 
 ### 4.4 App uid 与 `OWNER`
 
@@ -443,6 +459,42 @@ python3 scripts/product.py deploy
 
 > 规则：**启动盘和信任缓存每次从头生成**；guest 里的插件必须就是构建出的那个包。先在 guest 里换插件、
 > 再部署信任它的启动盘、最后重启，顺序不能反。
+
+### 5.4 生成 `data-pcie.img`（新装盘需要）
+
+转换器不需要外部仓库，源码就在 [research/pcie-data-2026-11-11/](file:///workspace/research/pcie-data-2026-11-11/)：
+
+1. 确认新盘的 seed 是空的，并生成 GPT 前后缀（脚本会断言 `DBRDISK1` 且 `extents=0`）：
+
+   ```sh
+   mkdir -p out/pcie
+   python3 research/pcie-data-2026-11-11/prepare-gpt.py \
+     artifacts/27.2/disk/scratch-data.img out/pcie
+   ```
+
+   输出 `data-gpt-prefix.bin`、`data-gpt-suffix.bin`。如果断言失败，说明 seed 已有数据区段，
+   这个转换器不适用（它只处理新装盘）。
+
+2. 交叉编译静态 aarch64 工具：
+
+   ```sh
+   aarch64-linux-gnu-gcc -O2 -static \
+     -o out/pcie/store-to-raw research/pcie-data-2026-11-11/store-to-raw.c
+   ```
+
+3. 停掉使用该盘的 VM，把 store、工具、GPT 前后缀推到手机：
+
+   ```sh
+   adb push artifacts/27.2/disk/data-store.img /data/local/tmp/
+   adb push out/pcie/{store-to-raw,data-gpt-prefix.bin,data-gpt-suffix.bin} /data/local/tmp/
+   adb shell su -c 'cd /data/local/tmp && ./store-to-raw \
+     data-store.img data-pcie.img data-gpt-prefix.bin data-gpt-suffix.bin'
+   ```
+
+   工具只复制位图标记的页面、保持稀疏，`fsync` 后逐字节回读，最后打印
+   `copy_and_byte_verify=PASS`。目标文件必须不存在（`O_EXCL`）。
+
+4. 把 `data-pcie.img` 放到 `/data/media/0/DroidVM/MacOS/`，并保持 `MACOS_DATA_PCI=1`。
 
 ---
 
@@ -572,14 +624,16 @@ python3 scripts/product.py status
 
 ## 10. 仍然存在的缺口（K90 首次适配要自己补）
 
-1. **机型支持**：仓库没有 K90 Pro Max 的验证记录；Gunyah、`gh_hugepage_reserve`、`crosvm-mmio` 必须由
-   App/内核提供。
-2. **App 配置工具**：`ios/tools/droidvm-app.py` 不在本仓库，部署脚本依赖它。
-3. **`edk2-macos.fd`**：只有外部构建产物，仓库内没有构建脚本。
-4. **`data-pcie.img` 转换器**：只在未入库的 `research/` 里；CI 产物只有 `data-store.img`。
-   由于 `configs/product-k27.json` 默认 `MACOS_DATA_PCI=1`，**一台完全没有 macOS 数据的全新 K90
-   无法只靠本仓库完成首次安装**：还需要一份已转换的 `data-pcie.img`（或改回 MMIO 数据盘并补
-   `NativeVirtioBlock`/`NativeRamBlock` kext）。
+1. **机型支持**：本仓库没有 K90 Pro Max 的验证记录；但固件仓库 `Droid-VM/edk2-gunyah` 的 README
+   已把 K90 Pro Max（SM8850，`myron`）列为测试机型。Gunyah、`gh_hugepage_reserve`、`crosvm-mmio`
+   仍必须由手机上的 App/内核提供。
+2. **App 配置工具**：`ios/tools/droidvm-app.py` 不在本仓库，也不在 Droid-VM 的公开仓库里；
+   它来自作者工作区的私有 `ios` 仓库（与本仓库同级）。没有它就只能手动建 VM / 编辑配置，
+   或走第 8 节的调试路径。
+3. **`edk2-macos.fd`**：不在本仓库，构建源是公开的 `Droid-VM/edk2-gunyah` 的 `macOS` 分支，
+   命令见 4.3。
+4. **`data-pcie.img` 转换器**：在仓库里（`research/pcie-data-2026-11-11/`），但没有接进
+   `product.py`/CI；需要手动执行 5.4，且只适用于空 seed、VM 已停机的新装盘。
 5. **CI 启动盘用参考 DTB**：必须用 K90 自己 dump 的 `generated.dtb` 重建 ADT。
 
 这五项里第 1 项是硬门槛，其余是流程/工具缺口。建议顺序：先过第 0 节，再用路线 B 或 A 产出
